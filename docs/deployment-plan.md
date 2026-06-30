@@ -1,7 +1,7 @@
-# Deployment Plan — Vercel + Railway
+# Deployment Plan — Vercel + Railway | Streamlit Cloud
 
-> **Frontend** → Vercel (static HTML/CSS/JS)  
-> **Backend** → Railway (FastAPI + ChromaDB + Embedding Model)
+> **Option A (Primary):** Frontend → Vercel · Backend → Railway  
+> **Option B (Alternative):** Full-stack → Streamlit Community Cloud
 
 > Reference: [architecture.md](file:///d:/NEXTLEAP%20GEN%20AI/RAG_CHATBOT/docs/architecture.md) · [implementation-plan.md](file:///d:/NEXTLEAP%20GEN%20AI/RAG_CHATBOT/docs/implementation-plan.md)
 
@@ -21,6 +21,7 @@
 10. [Cost Breakdown](#10-cost-breakdown)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Deployment Checklist](#12-deployment-checklist)
+13. [Alternative: Streamlit Cloud Deployment](#13-alternative-streamlit-cloud-deployment)
 
 ---
 
@@ -746,6 +747,387 @@ curl -X POST https://your-app.up.railway.app/api/chat \
 
 ---
 
-> **Document Version:** 2.0  
+## 13. Alternative: Streamlit Cloud Deployment
+
+If you want a **single-platform, zero-config** deployment instead of the Vercel + Railway split, you can deploy everything on [Streamlit Community Cloud](https://streamlit.io/cloud). This bundles the UI, backend logic, vector store, and embedding model into one Streamlit app.
+
+> [!IMPORTANT]
+> This approach uses the existing Streamlit UI in [`ui/app.py`](file:///d:/NEXTLEAP%20GEN%20AI/RAG_CHATBOT/ui/app.py). It runs everything in-process — no separate FastAPI server is needed.
+
+### 13.1 Architecture Overview
+
+```mermaid
+flowchart LR
+    subgraph STREAMLIT_CLOUD["Streamlit Community Cloud"]
+        UI["Streamlit UI\n(app.py)"]
+        EMB["Embedding Model\nBGE-small-en-v1.5"]
+        VDB["ChromaDB\n(In-memory)"]
+        GRD["Guardrails"]
+    end
+
+    subgraph EXTERNAL["External"]
+        GROQ["Groq API\nllama-3.3-70b"]
+    end
+
+    USER["User"] -->|HTTPS| UI
+    UI --> GRD
+    GRD --> EMB
+    EMB --> VDB
+    UI -->|LLM call| GROQ
+```
+
+| Component | Where It Runs | Notes |
+|-----------|---------------|-------|
+| **UI** | Streamlit Cloud | Built-in chat interface via `st.chat_message` |
+| **Embedding Model** | Streamlit Cloud | Loaded in-process (~130 MB) |
+| **Vector Store** | Streamlit Cloud | ChromaDB in-memory (rebuilt on each app restart) |
+| **LLM** | Groq (external) | API call — same as Railway approach |
+| **Guardrails** | Streamlit Cloud | Input/output guards run in-process |
+
+> [!WARNING]
+> Streamlit Community Cloud has **no persistent disk**. ChromaDB data lives in memory and is rebuilt from scraped data on every app restart (cold start). This adds ~30–60 seconds to the first load.
+
+### 13.2 Restructure the App for Streamlit Cloud
+
+Streamlit Cloud expects the entry point at the **repo root** or a configured path. You need to create a new `streamlit_app.py` at the project root that runs everything in-process (no FastAPI dependency).
+
+Create this file at the project root:
+
+```python
+# File: streamlit_app.py (project root)
+import streamlit as st
+import uuid
+from src.guardrails.input_guard import classify_query
+from src.guardrails.output_guard import validate_output
+from src.retrieval.vector_store import query as vector_query, collection
+from src.generation.llm_client import generate
+from src.generation.prompt_templates import (
+    SYSTEM_PROMPT, REFUSAL_PII, REFUSAL_ADVISORY,
+    REFUSAL_PROMPT_INJECTION, REFUSAL_TOO_LONG
+)
+from src.ingestion.embedder import embed_query
+
+# Page config
+st.set_page_config(
+    page_title="HDFC Mutual Fund FAQ Assistant",
+    page_icon="🏦",
+    layout="centered",
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .disclaimer-banner {
+        background-color: #fff3cd;
+        color: #856404;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+        font-weight: bold;
+        border: 1px solid #ffeeba;
+    }
+    .citation {
+        font-size: 0.8em;
+        color: #666;
+        margin-top: 5px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+# Header
+st.title("🏦 HDFC Mutual Fund FAQ Assistant")
+st.markdown(
+    '<div class="disclaimer-banner">⚠️ Facts-only. No investment advice.</div>',
+    unsafe_allow_html=True,
+)
+
+# Example questions
+example_questions = [
+    "What is the expense ratio of HDFC Mid Cap?",
+    "What is the exit load of HDFC Equity Fund?",
+    "What is the minimum SIP for HDFC Large Cap?",
+]
+st.markdown("**Try asking:**")
+cols = st.columns(3)
+prompt = None
+for i, q in enumerate(example_questions):
+    if cols[i].button(q, key=f"btn_{i}", use_container_width=True):
+        prompt = q
+
+user_input = st.chat_input("Type your question...")
+if user_input:
+    prompt = user_input
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message["role"] == "assistant" and message.get("source_url"):
+            st.markdown(
+                f'<div class="citation">📎 Source: <a href="{message["source_url"]}" target="_blank">{message["source_url"]}</a>'
+                f'<br>🕐 Last updated from sources: {message["last_updated"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+# Handle new input — all logic runs in-process
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        try:
+            # 1. Classify
+            intent = classify_query(prompt)
+            refusals = {
+                "PII_DETECTED": REFUSAL_PII,
+                "ADVISORY": REFUSAL_ADVISORY,
+                "PROMPT_INJECTION": REFUSAL_PROMPT_INJECTION,
+                "TOO_LONG": REFUSAL_TOO_LONG,
+            }
+            if intent in refusals:
+                answer = refusals[intent]
+                message_placeholder.markdown(answer)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer}
+                )
+            else:
+                # 2. Embed + Retrieve
+                query_embedding = embed_query(prompt)
+                results = vector_query(query_embedding=query_embedding, top_k=5)
+
+                if not results or not results.get("documents") or not results["documents"][0]:
+                    answer = "I don't have enough information to answer that."
+                    message_placeholder.markdown(answer)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": answer}
+                    )
+                else:
+                    chunks = results["documents"][0]
+                    metadatas = results["metadatas"][0]
+                    context = "\n\n".join(f"Document: {doc}" for doc in chunks)
+                    top_meta = metadatas[0] if metadatas else {}
+                    source_url = top_meta.get("source_url", "")
+                    scrape_date = top_meta.get("scrape_date", "Unknown")
+
+                    # 3. Generate
+                    raw_answer = generate(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_query=prompt,
+                        context=context,
+                    )
+
+                    # 4. Validate
+                    validated = validate_output(
+                        answer=raw_answer,
+                        source_url=source_url,
+                        scrape_date=scrape_date,
+                    )
+                    answer = validated["answer"]
+                    message_placeholder.markdown(answer)
+
+                    if validated["source_url"] and validated["last_updated"]:
+                        st.markdown(
+                            f'<div class="citation">📎 Source: <a href="{validated["source_url"]}" target="_blank">{validated["source_url"]}</a>'
+                            f'<br>🕐 Last updated from sources: {validated["last_updated"]}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "source_url": validated["source_url"],
+                        "last_updated": validated["last_updated"],
+                    })
+        except Exception as e:
+            error_msg = f"Sorry, something went wrong: {str(e)}"
+            message_placeholder.markdown(error_msg)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": error_msg}
+            )
+```
+
+> [!NOTE]
+> This file bypasses FastAPI entirely — it calls your `src/` modules directly. The existing [`ui/app.py`](file:///d:/NEXTLEAP%20GEN%20AI/RAG_CHATBOT/ui/app.py) calls FastAPI via HTTP; this version runs everything in-process.
+
+### 13.3 Prerequisites
+
+| Requirement | Details |
+|-------------|--------|
+| **GitHub account** | Streamlit Cloud deploys from GitHub |
+| **Streamlit Cloud account** | Free at [share.streamlit.io](https://share.streamlit.io) — sign in with GitHub |
+| **Groq API key** | Same key you already have |
+| **Code pushed to GitHub** | Same repo: `PranavKuntewar04/RAG_CHATBOT` |
+
+### 13.4 Deploy to Streamlit Community Cloud
+
+#### Step 1: Create the Streamlit config file
+
+Create `.streamlit/config.toml` at the project root:
+
+```toml
+# File: .streamlit/config.toml
+[server]
+headless = true
+port = 8501
+enableCORS = false
+enableXsrfProtection = false
+
+[theme]
+primaryColor = "#004B87"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1A1A2E"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+```
+
+#### Step 2: Update `requirements.txt`
+
+Streamlit Cloud installs dependencies from `requirements.txt` at the repo root. Your existing file already has everything needed. Just make sure `streamlit` is listed (it already is).
+
+#### Step 3: Add secrets
+
+Streamlit Cloud manages secrets via its dashboard (not `.env` files).
+
+1. Go to [share.streamlit.io](https://share.streamlit.io)
+2. Click **"New app"**
+3. Select your repo: `PranavKuntewar04/RAG_CHATBOT`
+4. Set **Main file path** to: `streamlit_app.py`
+5. Click **"Advanced settings"** → **"Secrets"**
+6. Paste your secrets in TOML format:
+
+```toml
+# Streamlit Cloud Secrets
+GROQ_API_KEY = "gsk_xxxxxxxxxxxxxxxx"
+LLM_PROVIDER = "groq"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+CHROMA_PERSIST_DIR = "/tmp/chroma_db"
+CHROMA_COLLECTION_NAME = "hdfc_mutual_funds"
+RETRIEVAL_TOP_K = "5"
+RERANK_TOP_K = "3"
+LLM_TEMPERATURE = "0.1"
+LLM_MAX_TOKENS = "256"
+SCRAPE_DELAY_SECONDS = "2"
+```
+
+> [!IMPORTANT]
+> Streamlit Cloud secrets are accessed via `st.secrets["KEY"]`, but your code uses `os.getenv()`. To bridge the gap, add this to the top of `streamlit_app.py`:
+> ```python
+> import os
+> # Load Streamlit secrets into environment variables
+> if hasattr(st, "secrets"):
+>     for key, value in st.secrets.items():
+>         os.environ[key] = str(value)
+> ```
+
+#### Step 4: Handle Data Ingestion on Startup
+
+Since Streamlit Cloud has no persistent disk, you need to run ingestion on every app startup. Add a cached initialization block to `streamlit_app.py`:
+
+```python
+# Add near the top of streamlit_app.py, after imports
+import os
+
+# Load Streamlit secrets into env vars
+if hasattr(st, "secrets"):
+    for key, value in st.secrets.items():
+        os.environ[key] = str(value)
+
+@st.cache_resource(show_spinner="Loading data & embedding model (first time only)...")
+def initialize_pipeline():
+    """Run ingestion once per app session. Cached so it survives reruns."""
+    from scripts.run_ingestion import main as run_ingestion
+    run_ingestion()
+    return True
+
+# This runs once when the app starts, then is cached
+initialize_pipeline()
+```
+
+> [!NOTE]
+> `@st.cache_resource` ensures ingestion runs **once per app instance**, not on every user interaction. It only re-runs when the app cold-starts (which happens after ~7 days of inactivity on the free tier).
+
+#### Step 5: Deploy
+
+1. Push all changes to GitHub:
+   ```bash
+   git add streamlit_app.py .streamlit/config.toml
+   git commit -m "Add Streamlit Cloud deployment files"
+   git push origin main
+   ```
+
+2. Go to [share.streamlit.io](https://share.streamlit.io)
+3. Click **"New app"**
+4. Configure:
+
+   | Setting | Value |
+   |---------|-------|
+   | **Repository** | `PranavKuntewar04/RAG_CHATBOT` |
+   | **Branch** | `main` |
+   | **Main file path** | `streamlit_app.py` |
+
+5. Click **"Deploy!"**
+
+Your app will be live at: `https://pranavkuntewar04-rag-chatbot-streamlit-app-xxxxx.streamlit.app`
+
+### 13.5 Streamlit Cloud Limitations
+
+| Aspect | Vercel + Railway | Streamlit Cloud |
+|--------|-----------------|----------------|
+| **Architecture** | Decoupled frontend + backend | Monolithic (all-in-one) |
+| **Persistent storage** | ✅ Railway volumes | ❌ No disk persistence |
+| **Cold start time** | ~5s (model load) | ~30–60s (model load + data ingestion) |
+| **Custom frontend** | ✅ Full control (HTML/CSS/JS) | ⚠️ Limited to Streamlit widgets |
+| **API for other clients** | ✅ FastAPI available | ❌ No standalone API |
+| **Free tier** | Railway: $5 trial, then $5/mo | ✅ Completely free |
+| **Auto-sleep** | Railway: always on (Hobby) | Sleeps after ~7 days of inactivity |
+| **Scaling** | Configurable on Railway | 1 instance, 1 GB RAM |
+| **CORS / Auth** | Full control | Streamlit handles it |
+| **Best for** | Production use, multi-client | Demos, prototypes, portfolio |
+
+### 13.6 Streamlit Cloud Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| **App crashes on startup** | Out of memory (1 GB limit) | Ensure `sentence-transformers` loads only `bge-small-en-v1.5` (~130 MB). Don't load multiple models. |
+| **"ModuleNotFoundError"** | Missing dependency | Ensure all imports are listed in `requirements.txt` |
+| **App is very slow on first load** | Cold start: model download + ingestion | Normal — `@st.cache_resource` ensures this only happens once per session |
+| **"Secrets not found" error** | Secrets not configured | Add secrets via Streamlit Cloud dashboard → App settings → Secrets |
+| **App sleeps after inactivity** | Free tier auto-sleep (7 days) | Normal — app wakes on next visit but has a cold start |
+| **ChromaDB errors** | Persist directory not writable | Use `/tmp/chroma_db` as the persist path on Streamlit Cloud |
+| **Git LFS / large files error** | Repo too large | Ensure `data/` with raw scraped files isn't committed. Scrape at runtime. |
+
+### 13.7 Streamlit Deployment Checklist
+
+```
+1. Create streamlit_app.py at project root    ← Section 13.2
+2. Create .streamlit/config.toml              ← Section 13.4 Step 1
+3. Push to GitHub                             ← Section 13.4 Step 5
+4. Configure secrets on Streamlit Cloud       ← Section 13.4 Step 3
+5. Deploy from share.streamlit.io             ← Section 13.4 Step 5
+6. Test end-to-end                            ← below
+```
+
+- [ ] `streamlit_app.py` created at project root with in-process logic
+- [ ] `.streamlit/config.toml` created with theme and server settings
+- [ ] `requirements.txt` includes `streamlit`, `sentence-transformers`, `chromadb`, `openai`
+- [ ] All secrets added to Streamlit Cloud dashboard
+- [ ] App deployed and accessible at `*.streamlit.app` URL
+- [ ] Factual query returns a correct answer
+- [ ] Advisory / PII queries are refused
+- [ ] Disclaimer banner is visible
+
+---
+
+> **Document Version:** 3.0  
 > **Last Updated:** 2026-06-30  
-> **Deployment Target:** Vercel (frontend) + Railway (backend)
+> **Deployment Targets:** Vercel + Railway (primary) · Streamlit Cloud (alternative)
