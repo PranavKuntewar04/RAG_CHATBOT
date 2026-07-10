@@ -1,51 +1,41 @@
 import pytest
+from scraper.utils import validate_url
+from scraper.groww_scraper import GrowwScraper
+from scraper.base_scraper import BaseScraper
 import os
-import tempfile
-import urllib.robotparser
-from unittest.mock import patch, mock_open
-from src.scraper.groww_scraper import fetch_with_retry, extract_slug
-from src.ingestion.parser import parse_html_file
 
-def test_extract_slug():
-    url = "https://groww.in/mutual-funds/hdfc-mid-cap-fund-direct-growth"
-    assert extract_slug(url) == "hdfc-mid-cap-fund-direct-growth"
+def test_validate_url():
+    assert validate_url("https://groww.in") == True
+    assert validate_url("not_a_url") == False
 
-@patch("src.scraper.groww_scraper.requests.get")
-def test_fetch_with_retry_success(mock_get):
-    mock_get.return_value.status_code = 200
-    mock_get.return_value.text = "<html>Test</html>"
-    
-    rp = urllib.robotparser.RobotFileParser()
-    rp.can_fetch = lambda ua, url: True
-    
-    html = fetch_with_retry("http://test.com", rp)
-    
-    assert html == "<html>Test</html>"
-    mock_get.assert_called_once()
+def test_base_scraper_instantiation():
+    # BaseScraper is abstract, should raise TypeError
+    with pytest.raises(TypeError):
+        BaseScraper()
 
-def test_parse_html_file():
+def test_groww_scraper_init():
+    scraper = GrowwScraper("dummy_urls.json", "dummy_raw", "dummy_processed")
+    assert scraper.urls_file == "dummy_urls.json"
+
+def test_parse_html():
+    scraper = GrowwScraper("dummy_urls.json", "dummy_raw", "dummy_processed")
     html_content = """
     <html>
-        <script id="__NEXT_DATA__">
-            {"props": {"pageProps": {"mfServerSideData": {
-                "scheme_name": "Test Fund",
-                "nav": 100.5,
-                "category": "Equity",
-                "expense_ratio": 1.2
-            }}}}
-        </script>
+        <body>
+            <h1>Fund Name</h1>
+            <table>
+                <tr><td>Expense Ratio</td><td>0.5%</td></tr>
+                <tr><td>Exit Load</td><td>1%</td></tr>
+            </table>
+            <p>Some more text here.</p>
+        </body>
     </html>
     """
+    scheme_meta = {"name": "Test Fund", "category": "Large Cap"}
+    result = scraper.parse(html_content, "https://test.com", scheme_meta)
     
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".html") as f:
-        f.write(html_content)
-        temp_path = f.name
-        
-    try:
-        parsed_doc, slug = parse_html_file(temp_path)
-        assert parsed_doc["scheme_name"] == "Test Fund"
-        assert parsed_doc["structured_data"]["nav"] == "100.5"
-        assert parsed_doc["structured_data"]["expense_ratio"] == "1.2%"
-        assert "Equity" in parsed_doc["category"]
-    finally:
-        os.remove(temp_path)
+    assert "metadata" in result
+    assert result["metadata"]["scheme_name"] == "Test Fund"
+    assert "Expense Ratio" in result["fund_details"]
+    assert result["fund_details"]["Expense Ratio"] == "0.5%"
+    assert "Some more text here." in result["text"]

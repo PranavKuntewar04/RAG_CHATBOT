@@ -1,124 +1,148 @@
 import streamlit as st
-import requests
-import uuid
+import sys
+import os
 
-# Configuration
-API_URL = "http://localhost:8000/api/chat"
+# Add parent directory to path so pipeline can be imported
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Set page configuration
-st.set_page_config(
-    page_title="HDFC Mutual Fund FAQ Assistant",
-    page_icon="🏦",
-    layout="centered",
-)
+from ui.components import load_css, render_header, render_disclaimer, render_example_questions, render_chat_message
 
-# Custom CSS for styling
-st.markdown("""
-<style>
-    .disclaimer-banner {
-        background-color: #fff3cd;
-        color: #856404;
-        padding: 10px;
-        border-radius: 5px;
-        margin-bottom: 20px;
-        font-weight: bold;
-        border: 1px solid #ffeeba;
+# We will initialize the actual pipeline components in Phase 7 (main.py) or here.
+# For now, we will set up the UI skeleton and state management.
+
+def initialize_session_state():
+    """Initialize Streamlit session state for chat history."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        
+        # Welcome message
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": "Hello! I am the HDFC Mutual Fund FAQ Assistant. How can I help you today?",
+            "citation": None,
+            "footer": None
+        })
+
+@st.cache_resource
+def get_pipeline():
+    """Initialize and cache the pipeline components."""
+    from pipeline.retriever import Retriever
+    from pipeline.prompt_builder import PromptBuilder
+    from pipeline.generator import LLMGenerator
+    from pipeline.response_formatter import ResponseFormatter
+    
+    return {
+        "retriever": Retriever(),
+        "prompt_builder": PromptBuilder(),
+        "generator": LLMGenerator(),
+        "formatter": ResponseFormatter()
     }
-    .citation {
-        font-size: 0.8em;
-        color: #666;
-        margin-top: 5px;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-# Session state initialization
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-
-# Header
-st.title("🏦 HDFC Mutual Fund FAQ Assistant")
-
-# Disclaimer Banner
-st.markdown('<div class="disclaimer-banner">⚠️ Facts-only. No investment advice.</div>', unsafe_allow_html=True)
-
-# Welcome message
-st.markdown("""
-Welcome! I can answer factual questions about HDFC Mutual Fund schemes.
-""")
-
-# Example questions
-example_questions = [
-    "What is the expense ratio of HDFC Mid Cap?",
-    "What is the exit load of HDFC Equity Fund?",
-    "What is the minimum SIP for HDFC Large Cap?"
-]
-
-st.markdown("**Try asking:**")
-cols = st.columns(3)
-
-# Handle example questions
-prompt = None
-for i, q in enumerate(example_questions):
-    if cols[i].button(q, key=f"btn_{i}", use_container_width=True):
-        prompt = q
-
-# Chat input
-user_input = st.chat_input("Type your question...")
-if user_input:
-    prompt = user_input
-
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message["role"] == "assistant" and message.get("source_url"):
-            st.markdown(f'<div class="citation">📎 Source: <a href="{message["source_url"]}" target="_blank">{message["source_url"]}</a><br>🕐 Last updated from sources: {message["last_updated"]}</div>', unsafe_allow_html=True)
-
-# Handle new user input
-if prompt:
+def handle_user_input(prompt: str):
+    """Process user input, update chat history, and generate a response."""
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     
     # Display user message in chat message container
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    render_chat_message("user", prompt)
 
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
+    from pipeline.query_classifier import QueryClassifier
+
+    with st.spinner("Searching for answers..."):
+        # 1. Classify the query
+        classification_result = QueryClassifier.classify(prompt)
         
-        try:
-            # Call FastAPI backend
-            response = requests.post(
-                API_URL,
-                json={"query": prompt, "session_id": st.session_state.session_id},
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            answer = data["answer"]
-            source_url = data.get("source_url", "")
-            last_updated = data.get("last_updated", "")
-            
-            message_placeholder.markdown(answer)
-            
-            # Display citation
-            if source_url and last_updated:
-                st.markdown(f'<div class="citation">📎 Source: <a href="{source_url}" target="_blank">{source_url}</a><br>🕐 Last updated from sources: {last_updated}</div>', unsafe_allow_html=True)
-            
-            # Add assistant response to chat history
+        if classification_result["classification"] != "FACTUAL":
+            # If not factual (e.g. advisory, PII), return the guardrail message
+            msg = classification_result["message"]
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": answer,
-                "source_url": source_url,
-                "last_updated": last_updated
+                "content": msg,
+                "citation": None,
+                "footer": None
             })
+            render_chat_message("assistant", msg)
+            return
+
+        try:
+            # Get cached pipeline
+            pipeline = get_pipeline()
             
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Sorry, I couldn't reach the server. Please ensure the backend API is running. (Error: {str(e)})"
-            message_placeholder.markdown(error_msg)
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            # 2. Retrieve context chunks
+            chunks = pipeline["retriever"].retrieve(prompt)
+            
+            # 3. Build the prompt
+            llm_prompt = pipeline["prompt_builder"].build_prompt(prompt, chunks)
+            
+            # 4. Generate the response
+            raw_response = pipeline["generator"].generate(llm_prompt)
+            
+            # 5. Format the response (extract citation and date from top chunk)
+            top_chunk = chunks[0] if chunks else {}
+            metadata = top_chunk.get("metadata", {})
+            source_url = metadata.get("source_url", "No Source URL")
+            scrape_date = metadata.get("scrape_date", "Unknown Date")
+            
+            formatted = pipeline["formatter"].format_response(raw_response, source_url, scrape_date)
+            
+            answer = formatted["answer"]
+            citation = formatted["citation"]
+            footer = formatted["footer"]
+            
+        except Exception as e:
+            answer = f"An error occurred while processing your request: {e}"
+            citation = None
+            footer = None
+
+        # Add assistant response to chat history
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "citation": citation,
+            "footer": footer
+        })
+        
+        render_chat_message("assistant", answer, citation, footer)
+
+
+def main():
+    # Setup page configuration
+    st.set_page_config(
+        page_title="HDFC MF FAQ Assistant",
+        page_icon="🏦",
+        layout="centered"
+    )
+
+    # Load UI styling and components
+    load_css()
+    render_header()
+    render_disclaimer()
+
+    # Initialize chat history
+    initialize_session_state()
+
+    # Display example questions and capture click
+    selected_example = render_example_questions()
+    
+    st.markdown("---")
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        render_chat_message(
+            message["role"], 
+            message["content"], 
+            message.get("citation"), 
+            message.get("footer")
+        )
+
+    # Accept user input
+    user_input = st.chat_input("Ask a question about HDFC Mutual Funds...")
+    
+    # Process example question click or manual input
+    if selected_example:
+        handle_user_input(selected_example)
+    elif user_input:
+        handle_user_input(user_input)
+
+if __name__ == "__main__":
+    main()

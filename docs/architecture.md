@@ -1,525 +1,546 @@
-# Architecture — Mutual Fund FAQ Assistant (RAG Chatbot)
+# Architecture: Mutual Fund FAQ Assistant (RAG Chatbot)
 
-> Reference: [context.md](file:///d:/NEXTLEAP%20GEN%20AI/RAG_CHATBOT/docs/context.md)
+> This document describes the end-to-end architecture of the HDFC Mutual Fund Facts-Only FAQ Assistant built using a Retrieval-Augmented Generation (RAG) pipeline.
 
 ---
 
-## 1. High-Level System Overview
+## 1. High-Level Architecture
 
 ```mermaid
 flowchart TB
-    subgraph UI["Frontend (Streamlit)"]
-        A[Chat Interface] --> B[User Query Input]
-        A --> C[Example Questions]
-        A --> D[Disclaimer Banner]
+    subgraph Ingestion["🔄 Data Ingestion Pipeline"]
+        SCHED["Scheduler Component\n(Daily Trigger)"] --> A
+        A["Web Scraper"] --> B["Document Preprocessor"]
+        B --> C["Text Chunker"]
+        C --> D["Embedding Model"]
+        D --> E["Vector Store"]
     end
 
-    subgraph BACKEND["Backend (FastAPI)"]
-        E["/api/chat Endpoint"]
-        F[Query Classifier]
-        G[Retrieval Engine]
-        H[Response Generator]
-        I[Guardrails Layer]
+    subgraph Runtime["⚡ Query-Time Pipeline"]
+        F["User Query"] --> G["Query Classifier"]
+        G -->|Factual| H["Query Embedding"]
+        G -->|Advisory / PII| I["Refusal Handler"]
+        H --> J["Vector Similarity Search"]
+        J --> K["Context Retriever"]
+        K --> L["Prompt Builder"]
+        L --> M["LLM Generator"]
+        M --> N["Response Formatter"]
+        N --> O["Chat UI"]
+        I --> O
     end
 
-    subgraph DATA["Data Pipeline (Offline)"]
-        J[Web Scraper] --> K[Document Parser]
-        K --> L[Text Chunker]
-        L --> M[Embedding Generator]
-        M --> N[(ChromaDB / FAISS Vector Store)]
-    end
+    E -.->|"Indexed Chunks"| J
 
-    B -->|HTTP POST| E
-    E --> F
-    F -->|Factual| G
-    F -->|Advisory / Out-of-scope| I
-    G -->|Top-K Chunks| H
-    H -->|Prompt + Context| O[LLM - Groq]
-    O -->|Raw Answer| I
-    I -->|Validated Response| E
-    E -->|JSON Response| A
-    G <-->|Similarity Search| N
+    style Ingestion fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Runtime fill:#16213e,stroke:#0f3460,color:#fff
 ```
 
 ---
 
-## 2. Architecture Layers
+## 2. Component Breakdown
 
-The system is organized into **five layers**, each with a clear responsibility:
+### 2.1 Data Ingestion Pipeline
 
-| Layer | Responsibility | Key Components |
-|-------|---------------|----------------|
-| **Presentation** | User interaction, chat UI | Streamlit app, disclaimer, example questions |
-| **API** | Request routing, session management | FastAPI server, `/api/chat` endpoint |
-| **Intelligence** | Query classification, response generation, guardrails | Query Classifier, LLM, Guardrails |
-| **Retrieval** | Semantic search over vectorized corpus | Embedding model, Vector store, Reranker |
-| **Data** | Offline ingestion, chunking, embedding | Web scraper, document parser, chunker |
-
----
-
-## 3. Data Ingestion Pipeline (Offline)
-
-This pipeline runs **offline / on-demand** to build and refresh the vector store.
-
-### 3.1 Pipeline Stages
+The ingestion pipeline runs **offline** (or on a scheduled basis) to build and refresh the vector store.
 
 ```mermaid
 flowchart LR
-    A["12 Groww URLs"] --> B["Web Scraper\n(requests + BeautifulSoup)"]
-    B --> C["Raw HTML"]
-    C --> D["Document Parser\n(extract structured text)"]
-    D --> E["Clean Text\n+ Metadata"]
-    E --> F["Text Chunker\n(RecursiveCharacterTextSplitter)"]
-    F --> G["Chunks\n(~500 tokens each)"]
-    G --> H["Embedding Model\n(sentence-transformers)"]
-    H --> I["Vector Store\n(ChromaDB)"]
+    subgraph Scheduler
+        T1["Daily Cron/Script"]
+    end
+
+    subgraph Sources["Data Sources"]
+        S1["Groww Scheme Pages\n(5 URLs)"]
+    end
+
+    subgraph Processing["Processing"]
+        P1["Web Scraper\n(BeautifulSoup / Selenium)"]
+        P3["Text Cleaner"]
+        P4["Chunker\n(RecursiveCharacterTextSplitter)"]
+        P5["Embedding Model\n(BGE)"]
+    end
+
+    subgraph Storage["Storage"]
+        V1["Vector Store\n(ChromaDB / FAISS)"]
+        M1["Metadata Store\n(JSON / SQLite)"]
+    end
+
+    T1 -->|Triggers| P1
+    S1 --> P1 --> P3 --> P4 --> P5 --> V1
+    P3 --> M1
 ```
 
-### 3.2 Web Scraping
+#### Data Sources
 
-| Aspect | Detail |
-|--------|--------|
-| **Tool** | `requests` + `BeautifulSoup4` (or `Selenium` for JS-rendered pages) |
-| **Targets** | 12 Groww scheme pages (sole data source — no PDFs or other external docs) |
-| **Extracted Fields** | Scheme name, NAV, expense ratio, exit load, min SIP, benchmark, risk level, fund manager, AUM, category, launch date |
-| **Rate Limiting** | 1–2 second delay between requests, respect `robots.txt` |
-| **Output** | JSON files per scheme stored in `data/raw/` |
+| Source | Format | Scraping Method | URLs |
+|---|---|---|---|
+| HDFC Large Cap Fund – Direct Growth | HTML | `requests` + `BeautifulSoup` / `Selenium` | [Groww Link](https://groww.in/mutual-funds/hdfc-large-cap-fund-direct-growth) |
+| HDFC Mid Cap Fund – Direct Growth | HTML | `requests` + `BeautifulSoup` / `Selenium` | [Groww Link](https://groww.in/mutual-funds/hdfc-mid-cap-fund-direct-growth) |
+| HDFC Small Cap Fund – Direct Growth | HTML | `requests` + `BeautifulSoup` / `Selenium` | [Groww Link](https://groww.in/mutual-funds/hdfc-small-cap-fund-direct-growth) |
+| HDFC Gold ETF Fund of Fund – Direct Growth | HTML | `requests` + `BeautifulSoup` / `Selenium` | [Groww Link](https://groww.in/mutual-funds/hdfc-gold-etf-fund-of-fund-direct-plan-growth) |
+| HDFC Silver ETF FoF – Direct Growth | HTML | `requests` + `BeautifulSoup` / `Selenium` | [Groww Link](https://groww.in/mutual-funds/hdfc-silver-etf-fof-direct-growth) |
 
-### 3.3 Document Parsing & Cleaning
+#### Web Scraper Module
 
 ```
-Raw HTML  →  Strip tags, scripts, styles
-          →  Extract relevant sections (scheme details, FAQ blocks)
-          →  Normalize whitespace, fix encoding
-          →  Attach metadata: { source_url, scheme_name, category, scrape_date }
-          →  Save as structured JSON in data/parsed/
+scraper/
+├── base_scraper.py          # Abstract base class for all scrapers
+├── groww_scraper.py          # Scrapes Groww mutual fund scheme pages
+└── utils.py                  # URL validation, rate limiting, retry logic
 ```
 
-### 3.4 Chunking Strategy
+**Key responsibilities:**
+- Fetch HTML content from the **5 Groww scheme URLs**
+- Parse and extract structured data (expense ratio, exit load, NAV, SIP details, etc.)
+- Store raw text with **source metadata** (URL, scrape date, scheme name)
 
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| **Method** | `RecursiveCharacterTextSplitter` (LangChain) | Respects sentence/paragraph boundaries |
-| **Chunk Size** | ~500 tokens (~2000 chars) | Balances context richness vs. retrieval precision |
-| **Chunk Overlap** | ~50 tokens (~200 chars) | Prevents information loss at boundaries |
-| **Metadata per chunk** | `scheme_name`, `category`, `source_url`, `section`, `scrape_date` | Enables filtered retrieval + citation |
+#### Document Preprocessor
 
-### 3.5 Embedding & Vector Store
+| Step | Description |
+|---|---|
+| **HTML Stripping** | Remove navigation, ads, footers — retain only content sections |
+| **Text Normalization** | Lowercase, remove extra whitespace, standardize date formats |
+| **Table Extraction** | Parse HTML tables into structured key-value pairs |
+| **Deduplication** | Remove duplicate content across overlapping sources |
+| **Metadata Tagging** | Attach source URL, scheme name, document type, scrape timestamp |
 
-| Aspect | Choice | Rationale |
-|--------|--------|-----------|
-| **Embedding Model** | `BAAI/bge-small-en-v1.5` (384-dim) | BGE family — strong retrieval quality, lightweight, open-source |
-| **Alternative** | `BAAI/bge-base-en-v1.5` (768-dim) | Higher quality, slightly more compute |
-| **Vector Store** | **ChromaDB** (persistent, local) | Zero-infra, Python-native, metadata filtering |
-| **Alternative** | FAISS | Faster at scale, but no built-in metadata filtering |
-| **Persistence** | `data/vectorstore/chroma_db/` | Survives restarts without re-embedding |
+#### Scheduler Component
+A dedicated `scheduler/daily_job.py` module runs independently of the web application. Using the `schedule` library (or an OS-level cron job), it triggers the web scraper and the embeddings pipeline every night to keep the ChromaDB Vector Store up to date with the latest fund data from Groww.
+
+#### Text Chunking Strategy
+
+```python
+# Chunking configuration
+CHUNK_CONFIG = {
+    "chunk_size": 500,          # tokens per chunk
+    "chunk_overlap": 50,        # overlapping tokens between chunks
+    "separator": ["\n\n", "\n", ". ", " "],  # split hierarchy
+    "metadata_fields": [
+        "source_url",
+        "scheme_name",
+        "document_type",
+        "section_heading",
+        "scrape_date"
+    ]
+}
+```
+
+**Why 500 tokens?**
+- Small enough to ensure high retrieval precision for specific facts (expense ratio, exit load)
+- Large enough to retain contextual coherence within a chunk
+- Overlap of 50 tokens prevents information loss at chunk boundaries
 
 ---
 
-## 4. Query Processing Pipeline (Online)
+### 2.2 Embedding & Vector Store
 
-This pipeline executes **per user query** at inference time.
+#### Embedding Model
 
-### 4.1 End-to-End Flow
+| Property | Value |
+|---|---|
+| **Model** | `BAAI/bge-small-en-v1.5` (or `BAAI/bge-base-en-v1.5` for higher accuracy) |
+| **Dimension** | 384 (bge-small) / 768 (bge-base) |
+| **Why?** | State-of-the-art retrieval performance on MTEB benchmarks, optimized for RAG use cases |
+| **Alternative** | `BAAI/bge-large-en-v1.5` (if higher accuracy is needed at the cost of speed) |
+
+#### Vector Store
+
+| Property | Value |
+|---|---|
+| **Primary** | **ChromaDB** (persistent, lightweight, Python-native) |
+| **Alternative** | FAISS (for larger-scale or production deployments) |
+| **Distance Metric** | Cosine similarity |
+| **Index Type** | HNSW (Hierarchical Navigable Small World) |
+
+```mermaid
+erDiagram
+    CHUNK {
+        string chunk_id PK
+        string text
+        float[] embedding
+        string source_url
+        string scheme_name
+        string document_type
+        string section_heading
+        date scrape_date
+    }
+
+    SCHEME {
+        string scheme_id PK
+        string scheme_name
+        string category
+        string groww_url
+        string amc_name
+    }
+
+    CHUNK }o--|| SCHEME : "belongs to"
+```
+
+**Stored metadata per chunk:**
+
+```json
+{
+  "chunk_id": "hdfc-largecap-factsheet-003",
+  "source_url": "https://groww.in/mutual-funds/hdfc-large-cap-fund-direct-growth",
+  "scheme_name": "HDFC Large Cap Fund – Direct Growth",
+  "document_type": "scheme_page",
+  "section_heading": "Fund Details",
+  "scrape_date": "2026-07-09"
+}
+```
+
+---
+
+### 2.3 Query-Time Pipeline
 
 ```mermaid
 sequenceDiagram
     actor User
-    participant UI as Streamlit UI
-    participant API as FastAPI Server
+    participant UI as Chat UI
     participant QC as Query Classifier
-    participant VDB as Vector Store
+    participant EMB as Embedding Model
+    participant VS as Vector Store
+    participant PB as Prompt Builder
     participant LLM as LLM (Groq)
-    participant Guard as Guardrails
+    participant RF as Response Formatter
 
-    User->>UI: Types question
-    UI->>API: POST /api/chat {query}
-    API->>QC: classify(query)
+    User->>UI: Asks question
+    UI->>QC: Classify query intent
     
-    alt Advisory / Out-of-scope
-        QC-->>Guard: REFUSED
-        Guard-->>API: Polite refusal + AMFI/SEBI link
-        API-->>UI: Refusal response
+    alt Advisory / PII Query
+        QC->>UI: Return refusal response + educational link
     else Factual Query
-        QC-->>API: FACTUAL
-        API->>VDB: similarity_search(query, top_k=5)
-        VDB-->>API: Top-K chunks + metadata
-        API->>LLM: prompt(system_prompt + context_chunks + query)
-        LLM-->>API: Raw answer
-        API->>Guard: validate(answer)
-        Guard-->>API: Validated answer + citation + footer
-        API-->>UI: Final response JSON
+        QC->>EMB: Encode query
+        EMB->>VS: Similarity search (top-k=3)
+        VS->>PB: Return relevant chunks + metadata
+        PB->>LLM: Send prompt (system + context + query)
+        LLM->>RF: Raw response
+        RF->>UI: Formatted response (≤3 sentences + citation + footer)
     end
     
-    UI-->>User: Displays answer
+    UI->>User: Display response
 ```
 
-### 4.2 Query Classification
+#### 2.3.1 Query Classifier
 
-A lightweight classifier determines query intent **before** retrieval:
+The query classifier is the **first gatekeeper** in the pipeline. It categorizes incoming queries before any retrieval happens.
 
-| Intent | Description | Action |
-|--------|-------------|--------|
-| `FACTUAL` | Objective question about a scheme's attributes | Proceed to retrieval + generation |
-| `ADVISORY` | Asks for recommendations, comparisons, or opinions | Return polite refusal |
-| `PII_DETECTED` | Contains PAN, Aadhaar, account numbers, etc. | Return privacy warning, do not process |
-| `OUT_OF_SCOPE` | Unrelated to mutual funds | Return scope clarification |
+| Classification | Action | Example |
+|---|---|---|
+| `FACTUAL` | Proceed to retrieval + generation | "What is the expense ratio of HDFC Large Cap Fund?" |
+| `ADVISORY` | Return refusal with educational link | "Should I invest in HDFC Small Cap Fund?" |
+| `COMPARISON` | Return refusal with factsheet link | "Which is better — HDFC Large Cap or Mid Cap?" |
+| `PII_DETECTED` | Block immediately with privacy notice | "My PAN is ABCDE1234F, check my portfolio" |
+| `OUT_OF_SCOPE` | Return polite redirection | "What is the weather today?" |
 
-**Implementation Options:**
+**Implementation approach:**
+- **Rule-based layer**: Regex patterns to detect PII (PAN, Aadhaar, phone, email) and advisory keywords ("should I", "recommend", "better", "best")
+- **LLM-based layer** (fallback): Use the LLM itself with a classification prompt for ambiguous queries
 
-1. **Keyword / Regex rules** — Fast, deterministic, handles common patterns
-2. **LLM-based classification** — Send query to LLM with a classification prompt (more flexible)
-3. **Hybrid** — Regex first for PII / obvious advisory, LLM fallback for ambiguous cases
-
-### 4.3 Retrieval Strategy
+#### 2.3.2 Retrieval Strategy
 
 ```python
-# Pseudocode for retrieval
-def retrieve(query: str, scheme_filter: str = None) -> list[Document]:
-    # 1. Embed the query
-    query_embedding = embedding_model.encode(query)
-    
-    # 2. Similarity search with optional metadata filter
-    filters = {"scheme_name": scheme_filter} if scheme_filter else {}
-    results = vector_store.similarity_search(
-        query_embedding,
-        k=5,               # Top-K candidates
-        filter=filters
-    )
-    
-    # 3. (Optional) Rerank with cross-encoder
-    reranked = cross_encoder.rerank(query, results, top_k=3)
-    
-    return reranked
+# Retrieval configuration
+RETRIEVAL_CONFIG = {
+    "top_k": 3,                       # Number of chunks to retrieve
+    "similarity_threshold": 0.65,     # Minimum cosine similarity score
+    "reranking": True,                # Enable cross-encoder reranking
+    "metadata_filter": {
+        "scheme_name": "<extracted from query>",  # Optional: filter by scheme
+    }
+}
 ```
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| **Initial Retrieval K** | 5 | Cast a wider net |
-| **Final Top-K (post-rerank)** | 3 | Feed to LLM context window |
-| **Similarity Metric** | Cosine similarity | Standard for sentence embeddings |
-| **Metadata Filtering** | By `scheme_name` when query mentions a specific fund | Improves precision significantly |
-| **Reranker (optional)** | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Improves relevance ranking |
+**Retrieval steps:**
+1. **Embed** the user query using the same embedding model
+2. **Vector search** against ChromaDB with `top_k=3`
+3. **Filter** results below the similarity threshold (0.65)
+4. **(Optional) Rerank** using a cross-encoder model for higher precision
+5. **Extract metadata** (source URL, scrape date) for citation
 
-### 4.4 LLM Response Generation
+#### 2.3.3 Prompt Builder
 
-| Aspect | Detail |
-|--------|--------|
-| **Primary LLM** | Groq (`llama-3.3-70b-versatile`) |
-| **Temperature** | `0.1` (near-deterministic for factual accuracy) |
-| **Max Output Tokens** | `256` (enforces conciseness) |
-| **System Prompt** | See § 4.5 below |
+The prompt builder assembles the final prompt sent to the LLM.
 
-### 4.5 System Prompt Design
+```
+┌─────────────────────────────────────────────────────┐
+│  SYSTEM PROMPT                                      │
+│  ─────────────────                                  │
+│  You are a facts-only mutual fund FAQ assistant.    │
+│  Rules:                                             │
+│  - Answer in ≤3 sentences                           │
+│  - Include exactly one source citation              │
+│  - Add footer: "Last updated from sources: <date>"  │
+│  - Never give investment advice                     │
+│  - If unsure, say "I don't have this information"   │
+├─────────────────────────────────────────────────────┤
+│  CONTEXT (Retrieved Chunks)                         │
+│  ─────────────────────────                          │
+│  [Chunk 1] Source: <url> | Scheme: <name>           │
+│  [Chunk 2] Source: <url> | Scheme: <name>           │
+│  [Chunk 3] Source: <url> | Scheme: <name>           │
+├─────────────────────────────────────────────────────┤
+│  USER QUERY                                         │
+│  ──────────                                         │
+│  <user's question>                                  │
+└─────────────────────────────────────────────────────┘
+```
 
-```text
-You are a facts-only FAQ assistant for HDFC Mutual Fund schemes.
+#### 2.3.4 LLM Generator
 
-RULES:
-1. Answer ONLY using the provided context chunks. Do NOT use prior knowledge.
-2. Keep your answer to a MAXIMUM of 3 sentences.
-3. Include exactly ONE source citation link from the context metadata.
-4. End every response with: "Last updated from sources: <scrape_date>"
-5. If the context does not contain the answer, say:
-   "I don't have this information in my current sources. Please visit
-   [HDFC Mutual Fund](https://www.hdfcfund.com) for the latest details."
-6. NEVER provide investment advice, opinions, or recommendations.
-7. NEVER compare fund performance or calculate returns.
-8. If asked for advice, respond: "I can only share verified facts about
-   mutual fund schemes. For investment guidance, please consult a
-   SEBI-registered advisor."
+| Property | Value |
+|---|---|
+| **Provider** | **Groq** |
+| **Primary Model** | `llama-3.3-70b-versatile` |
+| **Temperature** | `0.1` (low creativity, high factual accuracy) |
+| **Max Tokens** | `200` (enforces concise responses) |
+| **Fallback** | `gemma2-9b-it` (lighter alternative on Groq) |
 
-CONTEXT:
-{retrieved_chunks}
+> [!NOTE]
+> A low temperature (`0.1`) is critical for this use case — we prioritize factual accuracy over creative language.
 
-USER QUESTION:
-{user_query}
+#### 2.3.5 Response Formatter
+
+Every response is post-processed to ensure compliance:
+
+```python
+def format_response(raw_response, source_url, scrape_date):
+    """
+    Ensures every response follows the mandated format:
+    - ≤ 3 sentences
+    - Exactly 1 citation link
+    - Footer with last updated date
+    """
+    response = {
+        "answer": truncate_to_sentences(raw_response, max_sentences=3),
+        "citation": source_url,
+        "footer": f"Last updated from sources: {scrape_date}"
+    }
+    return response
 ```
 
 ---
 
-## 5. Guardrails & Safety
+### 2.4 Guardrails & Safety Layer
 
-### 5.1 Input Guardrails
+```mermaid
+flowchart LR
+    Q["User Query"] --> G1["PII Detector\n(Regex)"]
+    G1 -->|PII Found| BLOCK["🚫 Block + Privacy Notice"]
+    G1 -->|Clean| G2["Advisory Detector\n(Keywords + LLM)"]
+    G2 -->|Advisory| REFUSE["🚫 Polite Refusal + AMFI Link"]
+    G2 -->|Factual| G3["Scope Checker"]
+    G3 -->|Out of Scope| REDIRECT["🔄 Redirect to Supported Topics"]
+    G3 -->|In Scope| PROCEED["✅ Proceed to Retrieval"]
+```
 
-| Check | Implementation | Trigger Action |
-|-------|---------------|----------------|
-| **PII Detection** | Regex for PAN (`[A-Z]{5}[0-9]{4}[A-Z]`), Aadhaar (`\d{4}\s?\d{4}\s?\d{4}`), phone, email | Block query, return privacy warning |
-| **Advisory Intent** | Keyword list (`"should I"`, `"recommend"`, `"which is better"`, `"best fund"`) + LLM classification | Polite refusal + educational link |
-| **Prompt Injection** | Check for `"ignore previous"`, `"system prompt"`, role-play attempts | Block and return generic response |
-| **Query Length** | Max 500 characters | Truncate or reject |
+#### PII Detection Patterns
 
-### 5.2 Output Guardrails
+| PII Type | Regex Pattern | Action |
+|---|---|---|
+| PAN Number | `[A-Z]{5}[0-9]{4}[A-Z]` | Block |
+| Aadhaar Number | `[0-9]{4}\s?[0-9]{4}\s?[0-9]{4}` | Block |
+| Phone Number | `(\+91)?[6-9][0-9]{9}` | Block |
+| Email Address | `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}` | Block |
+| Account Number | `[0-9]{9,18}` | Flag for review |
 
-| Check | Implementation | Fallback |
-|-------|---------------|----------|
-| **Sentence Count** | Count sentences in LLM output, truncate if > 3 | Keep first 3 sentences |
-| **Citation Presence** | Verify exactly 1 URL in response | Append source URL from top chunk metadata |
-| **Footer Presence** | Check for `"Last updated from sources:"` | Append programmatically |
-| **Advisory Language** | Scan for `"recommend"`, `"should"`, `"best"`, `"I suggest"` | Regenerate or replace with disclaimer |
-| **Hallucination Check** | Verify key claims appear in retrieved chunks | Flag low-confidence answers |
+#### Advisory Query Keywords
+
+```python
+ADVISORY_KEYWORDS = [
+    "should i", "recommend", "better", "best", "worth it",
+    "good fund", "bad fund", "invest in", "buy", "sell",
+    "compare returns", "which one", "suggest", "opinion",
+    "prediction", "forecast", "will it grow"
+]
+```
 
 ---
 
-## 6. API Design
+### 2.5 User Interface
 
-### 6.1 Endpoints
+A minimal chat interface fulfilling the problem statement requirements.
 
-```
-POST /api/chat
-```
+```mermaid
+flowchart TB
+    subgraph ChatUI["Chat Interface"]
+        HEADER["🏦 HDFC Mutual Fund FAQ Assistant"]
+        DISCLAIMER["⚠️ Facts-only. No investment advice."]
+        
+        EXAMPLES["Example Questions:\n1. What is the expense ratio of HDFC Large Cap Fund?\n2. What is the exit load for HDFC Small Cap Fund?\n3. What is the minimum SIP amount for HDFC Mid Cap Fund?"]
+        
+        CHAT["💬 Chat Messages Area"]
+        INPUT["📝 Type your question..."]
+    end
 
-**Request:**
-```json
-{
-  "query": "What is the expense ratio of HDFC Mid Cap Fund?",
-  "session_id": "optional-session-uuid"
-}
-```
-
-**Response:**
-```json
-{
-  "answer": "The expense ratio of HDFC Mid Cap Fund Direct Growth is 0.74% (as of the latest factsheet).",
-  "source_url": "https://groww.in/mutual-funds/hdfc-mid-cap-fund-direct-growth",
-  "last_updated": "2026-06-28",
-  "intent": "FACTUAL",
-  "confidence": 0.92
-}
+    HEADER --> DISCLAIMER --> EXAMPLES --> CHAT --> INPUT
 ```
 
-```
-GET /api/health
-```
+**UI Stack:**
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "vector_store_docs": 156,
-  "last_ingestion": "2026-06-28T18:00:00Z"
-}
-```
+| Component | Technology |
+|---|---|
+| **Frontend** | Streamlit / Gradio (rapid prototyping) |
+| **Chat Component** | `st.chat_message` / Gradio `ChatInterface` |
+| **Styling** | Custom CSS for branding |
+| **Deployment** | Streamlit Cloud / Local |
 
-### 6.2 Error Responses
-
-| HTTP Code | Scenario |
-|-----------|----------|
-| `200` | Successful response (including refusals) |
-| `400` | Malformed request / query too long |
-| `422` | PII detected in query |
-| `500` | Internal error (LLM failure, vector store down) |
-| `503` | Service temporarily unavailable |
+**UI Features:**
+- Welcome message with HDFC AMC branding
+- 3 clickable example questions
+- Persistent disclaimer banner
+- Chat history within session
+- Citation links rendered as clickable hyperlinks
+- "Last updated" footer on every response
 
 ---
 
-## 7. Project Structure
+## 3. Project Directory Structure
 
 ```
 RAG_CHATBOT/
 ├── docs/
-│   ├── problemStatement.txt      # Original problem statement
-│   ├── context.md                # Distilled project context
-│   └── architecture.md           # This document
+│   ├── problemStatement.md          # Project requirements & scope
+│   ├── problemStatement.txt         # Original plain-text problem statement
+│   └── Architecture.md             # This document
 │
 ├── data/
-│   ├── raw/                      # Raw scraped HTML/JSON per scheme
-│   ├── parsed/                   # Cleaned, structured JSON documents
-│   └── vectorstore/              # ChromaDB persistent storage
-│       └── chroma_db/
+│   ├── raw/                        # Raw scraped HTML from Groww
+│   │   └── groww/                  # Groww scheme page snapshots
+│   ├── processed/                  # Cleaned & chunked text files
+│   └── urls.json                   # Master list of 5 Groww source URLs
 │
-├── src/
+├── scraper/
 │   ├── __init__.py
-│   ├── config.py                 # Centralized configuration & env vars
-│   ├── scraper/
-│   │   ├── __init__.py
-│   │   └── groww_scraper.py      # Scrape the 12 Groww scheme pages
-│   │
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── parser.py             # HTML → structured text
-│   │   ├── chunker.py            # Text → overlapping chunks
-│   │   └── embedder.py           # Chunks → vector embeddings
-│   │
-│   ├── retrieval/
-│   │   ├── __init__.py
-│   │   ├── vector_store.py       # ChromaDB wrapper (add, query)
-│   │   └── reranker.py           # Optional cross-encoder reranker
-│   │
-│   ├── generation/
-│   │   ├── __init__.py
-│   │   ├── llm_client.py         # LLM API wrapper (Gemini / OpenAI)
-│   │   ├── prompt_templates.py   # System prompt & few-shot templates
-│   │   └── response_builder.py   # Assemble final response with citation + footer
-│   │
-│   ├── guardrails/
-│   │   ├── __init__.py
-│   │   ├── input_guard.py        # PII detection, advisory detection, injection check
-│   │   └── output_guard.py       # Sentence cap, citation check, advisory scan
-│   │
-│   └── api/
-│       ├── __init__.py
-│       ├── server.py             # FastAPI app definition & routes
-│       └── models.py             # Pydantic request/response schemas
+│   ├── base_scraper.py             # Abstract scraper base class
+│   ├── groww_scraper.py            # Groww page scraper
+│   └── utils.py                    # Shared utilities
+│
+├── scheduler/
+│   ├── __init__.py
+│   └── daily_job.py                # Scheduled ingestion trigger
+│
+├── embeddings/
+│   ├── __init__.py
+│   ├── chunker.py                  # Text chunking logic
+│   ├── embedder.py                 # Embedding generation
+│   └── vector_store.py             # ChromaDB / FAISS operations
+│
+├── pipeline/
+│   ├── __init__.py
+│   ├── query_classifier.py         # Query intent classification
+│   ├── retriever.py                # Vector search & reranking
+│   ├── prompt_builder.py           # Prompt template assembly
+│   ├── generator.py                # LLM interaction (Groq)
+│   ├── response_formatter.py       # Output formatting & compliance
+│   └── guardrails.py               # PII detection & refusal handling
 │
 ├── ui/
-│   └── app.py                    # Streamlit chat interface
+│   ├── app.py                      # Streamlit / Gradio chat interface
+│   ├── components.py               # UI components (header, disclaimer)
+│   └── styles.css                  # Custom styling
 │
-├── scripts/
-│   ├── run_ingestion.py          # CLI to run full data pipeline
-│   └── run_server.py             # CLI to start the API server
+├── config/
+│   ├── settings.py                 # App configuration & constants
+│   └── prompts.py                  # System prompts & templates
 │
 ├── tests/
 │   ├── test_scraper.py
 │   ├── test_chunker.py
-│   ├── test_retrieval.py
-│   ├── test_guardrails.py
-│   └── test_api.py
+│   ├── test_retriever.py
+│   ├── test_classifier.py
+│   └── test_guardrails.py
 │
-├── .env.example                  # Template for API keys & config
-├── requirements.txt              # Python dependencies
-├── README.md                     # Setup, usage, limitations
-└── .gitignore
+├── .env                            # API key (Groq)
+├── .gitignore
+├── requirements.txt
+├── README.md
+└── main.py                         # Entry point
 ```
 
 ---
 
-## 8. Technology Stack
-
-| Component | Technology | Version / Notes |
-|-----------|-----------|-----------------|
-| **Language** | Python | 3.10+ |
-| **Web Framework** | FastAPI | Async, auto-docs at `/docs` |
-| **Frontend** | Streamlit | Rapid chat UI prototyping |
-| **Web Scraping** | requests + BeautifulSoup4 | Static pages; Selenium for JS-rendered |
-| **Text Splitting** | LangChain `RecursiveCharacterTextSplitter` | Configurable chunk size/overlap |
-| **Embeddings** | `BAAI/bge-small-en-v1.5` | BGE family, local, free, 384-dim |
-| **Vector Store** | ChromaDB | Persistent, local, metadata filtering |
-| **LLM** | Groq (`llama-3.3-70b-versatile`) | Fast inference, strong reasoning |
-| **LLM Orchestration** | LangChain | Chains, prompt templates, output parsers |
-| **Reranker (opt.)** | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Improves retrieval precision |
-| **Config** | python-dotenv | `.env` for API keys |
-| **Testing** | pytest | Unit + integration tests |
-
----
-
-## 9. Configuration & Environment Variables
-
-```bash
-# .env.example
-
-# LLM Configuration
-LLM_PROVIDER=groq
-GROQ_API_KEY=your-groq-key-here
-
-# Embedding Model
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-
-# Vector Store
-CHROMA_PERSIST_DIR=./data/vectorstore/chroma_db
-CHROMA_COLLECTION_NAME=hdfc_mutual_funds
-
-# Retrieval Parameters
-RETRIEVAL_TOP_K=5
-RERANK_TOP_K=3
-SIMILARITY_THRESHOLD=0.3
-
-# LLM Parameters
-LLM_TEMPERATURE=0.1
-LLM_MAX_TOKENS=256
-
-# Scraping
-SCRAPE_DELAY_SECONDS=2
-
-# Server
-API_HOST=0.0.0.0
-API_PORT=8000
-STREAMLIT_PORT=8501
-```
-
----
-
-## 10. Data Flow Summary
+## 4. Data Flow Summary
 
 ```mermaid
 flowchart LR
-    subgraph OFFLINE["Offline Pipeline (run once / periodically)"]
-        direction LR
-        S1["Groww URLs\n(12 schemes)"] --> S2["Scrape"]
-        S2 --> S3["Parse &\nClean"]
-        S3 --> S4["Chunk\n(~500 tok)"]
-        S4 --> S5["Embed\n(BGE)"]
-        S5 --> S6[("ChromaDB")]
+    subgraph Offline["Offline (Ingestion)"]
+        direction TB
+        A["5 Groww URLs"] --> B["Scrape & Parse"]
+        B --> C["Clean & Chunk\n(500 tokens, 50 overlap)"]
+        C --> D["Generate Embeddings\n(BGE-small-en-v1.5)"]
+        D --> E["Store in ChromaDB\n(with metadata)"]
     end
 
-    subgraph ONLINE["Online Pipeline (per query)"]
-        direction LR
-        Q1["User Query"] --> Q2["Classify\nIntent"]
-        Q2 -->|FACTUAL| Q3["Embed\nQuery"]
-        Q3 --> Q4["Search\nChromaDB"]
-        Q4 --> Q5["Top-K\nChunks"]
-        Q5 --> Q6["LLM\nGenerate"]
-        Q6 --> Q7["Guardrails\nValidate"]
-        Q7 --> Q8["Response\n+ Citation"]
+    subgraph Online["Online (Query Time)"]
+        direction TB
+        F["User Question"] --> G["Classify Intent"]
+        G --> H["Embed Query"]
+        H --> I["Vector Search\n(top-3, cosine ≥ 0.65)"]
+        I --> J["Build Prompt\n(system + context + query)"]
+        J --> K["LLM Generate\n(temp=0.1, max 200 tokens)"]
+        K --> L["Format Response\n(≤3 sentences + citation + footer)"]
     end
 
-    S6 -.->|Read| Q4
+    E -.-> I
+
+    style Offline fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
+    style Online fill:#0d1117,stroke:#3fb950,color:#c9d1d9
 ```
 
 ---
 
-## 11. Deployment Strategy
+## 5. Technology Stack Summary
 
-### 11.1 Local Development
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Run data ingestion (one-time)
-python scripts/run_ingestion.py
-
-# 3. Start API server
-python scripts/run_server.py           # FastAPI on :8000
-
-# 4. Start UI (separate terminal)
-streamlit run ui/app.py --server.port 8501
-```
-
-### 11.2 Production Considerations
-
-| Concern | Approach |
-|---------|----------|
-| **Scalability** | Containerize with Docker; use Gunicorn + Uvicorn workers |
-| **Vector Store** | Migrate to managed service (Pinecone, Weaviate) if corpus grows |
-| **Caching** | Cache frequent queries + responses (Redis / in-memory LRU) |
-| **Monitoring** | Log queries, latencies, refusal rates; alert on LLM errors |
-| **Data Freshness** | Schedule weekly re-scrape via cron to update NAV and scheme data |
-| **Rate Limiting** | Apply per-IP rate limits on `/api/chat` |
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Language** | Python 3.10+ | Core development language |
+| **Web Scraping** | `requests`, `BeautifulSoup4`, `Selenium` | Groww page HTML extraction |
+| **Text Chunking** | `langchain.text_splitter` | Recursive character splitting |
+| **Embeddings** | `BAAI/bge-small-en-v1.5` (HuggingFace) | Text → vector conversion |
+| **Vector Store** | `ChromaDB` | Persistent vector storage & search |
+| **LLM** | Groq (`llama-3.3-70b-versatile` / `gemma2-9b-it`) | Response generation |
+| **Orchestration** | `LangChain` | RAG pipeline orchestration |
+| **UI** | `Streamlit` / `Gradio` | Chat interface |
+| **Testing** | `pytest` | Unit & integration tests |
+| **Environment** | `python-dotenv` | API key management |
 
 ---
 
-## 12. Key Design Decisions
+## 6. Key Design Decisions
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| ChromaDB over Pinecone | **ChromaDB** | Zero cost, local-first, sufficient for ~200 chunks |
-| BGE over OpenAI embeddings | **BAAI/bge-small-en-v1.5** | No API cost, strong retrieval quality, privacy |
-| FastAPI over Flask | **FastAPI** | Async, auto-generated docs, Pydantic validation |
-| Streamlit over React | **Streamlit** | Faster to build, sufficient for minimal chat UI |
-| Hybrid guardrails (regex + LLM) | **Hybrid** | Regex for deterministic checks, LLM for nuanced intent |
-| Chunk size 500 tokens | **500 tokens** | Balances retrieval granularity vs. context richness |
-| Temperature 0.1 | **Near-zero** | Factual accuracy > creativity |
+| Decision | Rationale |
+|---|---|
+| **ChromaDB over Pinecone/Weaviate** | Lightweight, runs locally, no cloud dependency, ideal for a 5-URL corpus |
+| **Chunk size of 500 tokens** | Balances retrieval precision (specific facts) with contextual coherence |
+| **Top-3 retrieval** | Provides sufficient context without overwhelming the LLM prompt |
+| **Temperature 0.1** | Prioritizes factual accuracy over creative generation |
+| **Rule-based PII detection** | Faster and more deterministic than LLM-based detection for known patterns |
+| **Streamlit for UI** | Fastest path to a functional chat interface; built-in chat components |
+| **Metadata-rich chunks** | Enables source citation and "last updated" footer without additional lookups |
 
 ---
 
-## 13. Limitations & Known Risks
+## 7. Non-Functional Requirements
 
-| Risk | Mitigation |
-|------|------------|
-| **Stale data** | Schedule periodic re-scraping; display `Last updated` date |
-| **Scraping breakage** | Groww HTML structure changes → scraper maintenance needed |
-| **LLM hallucination** | Low temperature + retrieved-context-only prompt + output validation |
-| **Incomplete coverage** | 12 schemes × 1 AMC only; out-of-scope queries get refusal |
-| **No auth/rate-limit** | Add API key auth + rate limiter before public deployment |
-| **Single-turn only** | No conversation memory; each query is independent |
+| Requirement | Target |
+|---|---|
+| **Response Latency** | < 3 seconds per query |
+| **Accuracy** | > 90% factual correctness on test queries |
+| **Availability** | Local deployment (no SLA required) |
+| **Data Freshness** | Re-scrape corpus weekly or on-demand |
+| **Compliance** | Zero investment advice; zero PII storage |
+| **Scalability** | Designed for 5 schemes; extendable to full AMC catalog |
+
+---
+
+## 8. Future Enhancements
+
+| Enhancement | Description |
+|---|---|
+| **Multi-AMC Support** | Extend beyond HDFC to cover SBI, ICICI Prudential, etc. |
+| **Conversation Memory** | Multi-turn conversations with context carry-over |
+| **Feedback Loop** | User thumbs up/down to improve retrieval quality |
+| **API Layer** | REST API wrapper (FastAPI) for integration with other systems |
+| **Advanced Reranking** | Cross-encoder reranking for improved retrieval precision |
+| **Caching** | Cache frequent queries to reduce LLM API costs |
