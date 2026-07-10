@@ -1,0 +1,31 @@
+{
+  "amc": "HDFC Mutual Fund",
+  "schemes": [
+    {
+      "name": "HDFC Large Cap Fund – Direct Growth",
+      "category": "Large Cap",
+      "url": "https://groww.in/mutual-funds/hdfc-large-cap-fund-direct-growth"
+    },
+    {
+      "name": "HDFC Mid Cap Fund – Direct Growth",
+      "category": "Mid Cap",
+      "url": "https://groww.in/mutual-funds/hdfc-mid-cap-fund-direct-growth"
+    },
+    {
+      "name": "HDFC Small Cap Fund – Direct Growth",
+      "category": "Small Cap",
+      "url": "https://groww.in/mutual-funds/hdfc-small-cap-fund-direct-growth"
+    },
+    {
+      "name": "HDFC Gold ETF Fund of Fund – Direct Growth",
+      "category": "Gold (Commodity)",
+      "url": "https://groww.in/mutual-funds/hdfc-gold-etf-fund-of-fund-direct-plan-growth"
+    },
+    {
+      "name": "HDFC Silver ETF FoF – Direct Growth",
+      "category": "Silver (Commodity)",
+      "url": "https://groww.in/mutual-funds/hdfc-silver-etf-fof-direct-growth"
+    }
+  ],
+  "last_updated": "2026-07-10T15:40:32.263349"
+}
