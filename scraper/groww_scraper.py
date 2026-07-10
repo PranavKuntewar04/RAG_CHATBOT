@@ -1,9 +1,13 @@
 from bs4 import BeautifulSoup
 import json
 import os
+import sys
 from datetime import datetime
 import re
-from .base_scraper import BaseScraper
+
+# Add scraper directory to path for direct-script execution
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from base_scraper import BaseScraper
 
 class GrowwScraper(BaseScraper):
     def __init__(self, urls_file: str, raw_dir: str, processed_dir: str):
@@ -139,3 +143,14 @@ class GrowwScraper(BaseScraper):
                 
             except Exception as e:
                 print(f"Failed to process {name}: {e}")
+
+if __name__ == "__main__":
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    urls_file = os.path.join(base_dir, "data", "urls.json")
+    raw_dir = os.path.join(base_dir, "data", "raw", "groww")
+    processed_dir = os.path.join(base_dir, "data", "processed")
+
+    scraper = GrowwScraper(urls_file, raw_dir, processed_dir)
+    print("Starting scrape of all schemes...")
+    scraper.scrape_all_schemes()
+    print("Scraping complete.")

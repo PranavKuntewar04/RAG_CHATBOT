@@ -1,8 +1,12 @@
 from abc import ABC, abstractmethod
 import requests
 import os
+import sys
 import json
-from .utils import rate_limiter, retry, validate_url
+
+# Add scraper directory to path for direct-script execution
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from utils import rate_limiter, retry, validate_url
 
 class BaseScraper(ABC):
     def __init__(self):
